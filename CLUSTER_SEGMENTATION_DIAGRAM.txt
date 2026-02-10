@@ -1,0 +1,400 @@
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║                    CLUSTER-BASED SEGMENTATION WORKFLOW                            ║
+║                         ITK-SNAP 3D DICOM Processing                              ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           PHASE 1: DICOM LOADING                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────┐
+    │  DICOM Directory │
+    │  (Series Files)  │
+    └────────┬─────────┘
+             │
+             │ GuidedNativeImageIO::ReadImage()
+             │ - Parse directory for DICOM files
+             │ - Identify series by Series UID
+             │ - Sort by Image Position Patient (IPP)
+             ↓
+    ┌────────────────────────────────┐
+    │  ExtendedGDCMSerieHelper       │
+    │  - Group files by series       │
+    │  - Sort slices spatially       │
+    │  - Handle multi-frame DICOM    │
+    └────────┬───────────────────────┘
+             │
+             │ GDCM Reader
+             ↓
+    ┌────────────────────────────────┐
+    │  ITK Image3D (Volume)          │
+    │  - Pixel data in memory        │
+    │  - Spatial metadata preserved  │
+    │  - Multiple components support │
+    └────────┬───────────────────────┘
+             │
+             ↓
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      PHASE 2: DATA SAMPLING & PREPARATION                       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌────────────────────────────────┐
+    │  SNAPImageData                 │
+    │  - Main image + Overlays       │
+    │  - Multi-component support     │
+    └────────┬───────────────────────┘
+             │
+             │ UnsupervisedClustering::SampleDataSource()
+             │
+    ┌────────┴───────────────────────────────────────────────────────┐
+    │  Random Voxel Sampling                                         │
+    │  - Sample ~10,000 voxels (or all if fewer)                    │
+    │  - Use itk::ImageRandomConstIteratorWithIndex                 │
+    │  - Collect from all image components                          │
+    │  - Skip non-finite values (NaN, Inf)                          │
+    │  - Store "center samples" from central 60% of image           │
+    └────────┬───────────────────────────────────────────────────────┘
+             │
+             ↓
+    ┌────────────────────────────────────────────────────┐
+    │  Feature Matrix: m_Samples                         │
+    │  Dimensions: [N_samples × N_components]            │
+    │  Example: [10,000 × 3] for RGB image              │
+    │           [10,000 × 1] for grayscale              │
+    │           [10,000 × 6] for 6-component multi-seq  │
+    └────────┬───────────────────────────────────────────┘
+             │
+             ↓
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 3: CLUSTER INITIALIZATION (K-MEANS++)                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌────────────────────────────────┐
+    │  KMeansPlusPlus::Initialize()  │
+    └────────┬───────────────────────┘
+             │
+             │ ALGORITHM:
+             │ 1. Randomly select first centroid from samples
+             │ 2. For each remaining centroid:
+             │    a. Compute distance² of each point to nearest centroid
+             │    b. Select new centroid with probability ∝ distance²
+             │ 3. Assign samples to nearest centroids
+             │ 4. Compute initial statistics per cluster
+             │
+             ↓
+    ┌────────────────────────────────────────────────────┐
+    │  Initial Gaussian Parameters                       │
+    │  For each of K clusters:                           │
+    │    - Mean μ_k (centroid of assigned samples)      │
+    │    - Covariance Σ_k (scatter of assigned samples) │
+    │    - Weight w_k (proportion of samples in cluster)│
+    └────────┬───────────────────────────────────────────┘
+             │
+             │ Create GaussianMixtureModel
+             ↓
+    ┌────────────────────────────────┐
+    │  Initial GMM                   │
+    │  p(x) = Σ w_k·𝒩(x|μ_k,Σ_k)    │
+    └────────┬───────────────────────┘
+             │
+             ↓
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                  PHASE 4: EM REFINEMENT (ITERATIVE OPTIMIZATION)                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌────────────────────────────────────────┐
+    │  EMGaussianMixtures::UpdateOnce()      │
+    │  (Called 10 times or until convergence)│
+    └────────┬───────────────────────────────┘
+             │
+             │ ┌────────────────────────────────────────────────┐
+             │ │  E-STEP: Compute Posterior Probabilities       │
+             │ │                                                │
+             │ │  For each sample x_i and cluster k:            │
+             │ │                                                │
+             │ │  1. Compute log PDF:                           │
+             │ │     log_pdf[k] = log(𝒩(x_i | μ_k, Σ_k))       │
+             │ │                                                │
+             │ │  2. Compute posterior (responsibility):        │
+             │ │     γ_ik = P(k|x_i)                            │
+             │ │          = w_k·𝒩(x_i|μ_k,Σ_k)                 │
+             │ │            ─────────────────────               │
+             │ │            Σⱼ w_j·𝒩(x_i|μⱼ,Σⱼ)                │
+             │ │                                                │
+             │ │  3. Store in m_latent[i][k]                    │
+             │ └────────────────────────────────────────────────┘
+             ↓
+             │ ┌────────────────────────────────────────────────┐
+             │ │  M-STEP: Update Parameters                     │
+             │ │                                                │
+             │ │  For each cluster k:                           │
+             │ │                                                │
+             │ │  1. Update weight:                             │
+             │ │     w_k = (1/N) Σᵢ γ_ik                        │
+             │ │                                                │
+             │ │  2. Update mean:                               │
+             │ │     μ_k = (Σᵢ γ_ik·x_i) / (Σᵢ γ_ik)           │
+             │ │                                                │
+             │ │  3. Update covariance:                         │
+             │ │     Σ_k = (Σᵢ γ_ik·(x_i-μ_k)(x_i-μ_k)ᵀ)       │
+             │ │           ───────────────────────────          │
+             │ │                  Σᵢ γ_ik                       │
+             │ └────────────────────────────────────────────────┘
+             ↓
+             │ ┌────────────────────────────────────────────────┐
+             │ │  Convergence Check                             │
+             │ │                                                │
+             │ │  Compute log-likelihood:                       │
+             │ │  ℓ = Σᵢ log(Σₖ w_k·𝒩(x_i|μ_k,Σ_k))            │
+             │ │                                                │
+             │ │  If |ℓ_new - ℓ_old| < ε → CONVERGED            │
+             │ │  Else → Repeat E-step and M-step               │
+             │ └────────────────────────────────────────────────┘
+             ↓
+    ┌────────────────────────────────────────┐
+    │  SortClustersByRelevance()             │
+    │  - Evaluate GMM on central samples     │
+    │  - Compute posterior for each cluster  │
+    │  - Sort by relevance (high → low)      │
+    │  - Reorder clusters accordingly        │
+    └────────┬───────────────────────────────┘
+             │
+             ↓
+    ┌────────────────────────────────┐
+    │  Final Refined GMM             │
+    │  - Optimal cluster parameters  │
+    │  - Sorted by relevance         │
+    └────────┬───────────────────────┘
+             │
+             ↓
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                       PHASE 5: FULL IMAGE CLASSIFICATION                        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌────────────────────────────────────────┐
+    │  GMMClassifyImageFilter                │
+    │  - Input: Full 3D image(s)             │
+    │  - Input: Trained GMM                  │
+    │  - Multi-threaded processing           │
+    └────────┬───────────────────────────────┘
+             │
+             │ DynamicThreadedGenerateData()
+             │
+    ┌────────┴────────────────────────────────────────────────────┐
+    │  For Each Voxel in Image:                                   │
+    │                                                              │
+    │  1. Extract feature vector x from all image components      │
+    │                                                              │
+    │  2. For each cluster k:                                     │
+    │     log_pdf[k] = log(𝒩(x | μ_k, Σ_k))                      │
+    │                                                              │
+    │  3. Compute posteriors using log-space arithmetic:          │
+    │     p[k] = ComputePosterior(log_pdf, w, log_w, k)          │
+    │                                                              │
+    │  4. Compute weighted probability difference:                │
+    │     pdiff = Σₖ p[k] · f_k                                   │
+    │     where f_k = +1 if foreground cluster                    │
+    │                -1 if background cluster                     │
+    │                                                              │
+    │  5. Scale and store:                                        │
+    │     output[voxel] = pdiff × 0x7fff (32767)                  │
+    └─────────────────────────────────────────────────────────────┘
+             │
+             ↓
+    ┌────────────────────────────────┐
+    │  Speed/Probability Map         │
+    │  - Range: [-32767, 32767]      │
+    │  - Positive: Foreground prob.  │
+    │  - Negative: Background prob.  │
+    │  - Zero: Equal probability     │
+    └────────┬───────────────────────┘
+             │
+             ↓
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 6: USER INTERACTION & REFINEMENT                       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌────────────────────────────────────────────────────────────┐
+    │  SnakeWizardModel - User Interface                         │
+    │                                                             │
+    │  User Can:                                                  │
+    │  1. Adjust number of clusters (3-10 typical)               │
+    │  2. Mark clusters as foreground/background                 │
+    │  3. Manually adjust cluster means                          │
+    │  4. Adjust cluster weights                                 │
+    │  5. Run additional EM iterations                           │
+    │  6. Preview segmentation results in real-time              │
+    └────────┬───────────────────────────────────────────────────┘
+             │
+             │ User modifications trigger:
+             │ TagGMMPreprocessingFilterModified()
+             ↓
+    ┌────────────────────────────────┐
+    │  Re-classify with Updated GMM  │
+    │  (Steps in Phase 5 repeated)   │
+    └────────┬───────────────────────┘
+             │
+             ↓
+    ┌────────────────────────────────┐
+    │  Updated Probability Map       │
+    │  (Preview in GUI)              │
+    └────────┬───────────────────────┘
+             │
+             ↓
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    PHASE 7: FINAL SEGMENTATION (OPTIONAL)                       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌────────────────────────────────┐
+    │  Speed Map                     │
+    └────────┬───────────────────────┘
+             │
+             │ Option 1: Direct Thresholding
+             ├────────────────────────────────────┐
+             │                                    │
+             ↓                                    ↓
+    ┌────────────────────┐           ┌────────────────────────┐
+    │  Threshold at 0    │           │  Snake/Level Set       │
+    │  (speed > 0)       │           │  Evolution             │
+    │                    │           │  - Use speed map as    │
+    │  Result:           │           │    evolution force     │
+    │  Binary mask       │           │  - Refine boundaries   │
+    │                    │           │  - Smooth contours     │
+    └────────┬───────────┘           └────────┬───────────────┘
+             │                                 │
+             └─────────────┬───────────────────┘
+                           ↓
+                  ┌────────────────────────────┐
+                  │  Final Segmentation        │
+                  │  - Binary label image      │
+                  │  - Multi-label support     │
+                  │  - Export as DICOM/NIFTI   │
+                  └────────────────────────────┘
+
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║                            KEY DATA STRUCTURES                                    ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  GaussianMixtureModel                                                          │
+│  ┌──────────────────────────────────────────────────────────────────────────┐ │
+│  │  - m_gaussian: Vector<Gaussian*>   // One per cluster                    │ │
+│  │  - m_weight: Vector<double>        // Mixture weights (sum = 1.0)        │ │
+│  │  - m_foreground_state: Vector<bool> // User-assigned fg/bg flags        │ │
+│  │  - m_numOfGaussian: int            // Number of clusters                 │ │
+│  │  - m_dimOfGaussian: int            // Feature dimensionality             │ │
+│  └──────────────────────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  Gaussian (Single Multivariate Gaussian)                                       │
+│  ┌──────────────────────────────────────────────────────────────────────────┐ │
+│  │  - m_mean: VectorType              // μ (d-dimensional)                  │ │
+│  │  - m_covariance: MatrixType        // Σ (d×d matrix)                     │ │
+│  │  - m_covarianceInverse: MatrixType // Σ⁻¹ (for efficiency)               │ │
+│  │  - m_covarianceDet: double         // |Σ| (determinant)                  │ │
+│  │  - m_normalizationFactor: double   // 1/((2π)^(d/2) * |Σ|^(1/2))        │ │
+│  └──────────────────────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────┐
+│  UnsupervisedClustering                                                        │
+│  ┌──────────────────────────────────────────────────────────────────────────┐ │
+│  │  - m_Samples: vnl_matrix<double>   // [N_samples × N_components]         │ │
+│  │  - m_ClusteringEM: EMGaussianMixtures*  // EM optimizer                  │ │
+│  │  - m_ClusteringInitializer: KMeansPlusPlus*  // K-means++ init           │ │
+│  │  - m_MixtureModel: GaussianMixtureModel*  // Current GMM                 │ │
+│  │  - m_DataSource: SNAPImageData*    // Image data source                  │ │
+│  │  - m_CenterSamples: Vector<int>    // Indices of central samples         │ │
+│  └──────────────────────────────────────────────────────────────────────────┘ │
+└────────────────────────────────────────────────────────────────────────────────┘
+
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║                              MATHEMATICAL FORMULAS                                ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+Multivariate Gaussian PDF:
+    𝒩(x | μ, Σ) = (1 / ((2π)^(d/2) |Σ|^(1/2))) · exp(-0.5 (x-μ)ᵀ Σ⁻¹ (x-μ))
+
+Gaussian Mixture Model:
+    p(x) = Σₖ₌₁ᴷ wₖ · 𝒩(x | μₖ, Σₖ)
+    where Σₖ wₖ = 1
+
+Posterior Probability (Responsibility):
+    γᵢₖ = P(cluster k | sample i) = (wₖ · 𝒩(xᵢ | μₖ, Σₖ)) / (Σⱼ wⱼ · 𝒩(xᵢ | μⱼ, Σⱼ))
+
+Log-Likelihood:
+    ℓ = Σᵢ log(Σₖ wₖ · 𝒩(xᵢ | μₖ, Σₖ))
+
+EM Update Equations:
+    wₖ = (1/N) Σᵢ γᵢₖ
+    μₖ = (Σᵢ γᵢₖ · xᵢ) / (Σᵢ γᵢₖ)
+    Σₖ = (Σᵢ γᵢₖ · (xᵢ - μₖ)(xᵢ - μₖ)ᵀ) / (Σᵢ γᵢₖ)
+
+Final Speed/Probability Value:
+    speed(x) = 0x7fff · Σₖ P(k|x) · fₖ
+    where fₖ = +1 if k is foreground cluster, -1 if background
+
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║                              PERFORMANCE NOTES                                    ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+1. Sampling Optimization:
+   - Uses at most 10,000 samples instead of millions of voxels
+   - Reduces memory footprint and training time
+   - Typically sufficient for good parameter estimation
+
+2. Multi-threading:
+   - GMMClassifyImageFilter uses ITK's DynamicThreadedGenerateData
+   - Parallelizes across image regions
+   - Scales with available CPU cores
+
+3. Numerical Stability:
+   - All probability computations use log-space
+   - Prevents underflow for very small probabilities
+   - ComputePosterior() uses log-sum-exp trick
+
+4. Memory Efficiency:
+   - Samples stored as vnl_matrix (contiguous memory)
+   - Posteriors computed on-the-fly during classification
+   - No need to store full probability maps during training
+
+5. K-means++ Initialization:
+   - Better initialization than random selection
+   - Typically requires fewer EM iterations
+   - More consistent results across runs
+
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║                                FILE LOCATIONS                                     ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+DICOM Loading:
+  Logic/ImageWrapper/GuidedNativeImageIO.{h,cxx}
+  Common/MultiFrameDicomSeriesSorter.h
+  Common/ExtendedGDCMSerieHelper.cxx
+
+Clustering Core:
+  Logic/Preprocessing/GMM/UnsupervisedClustering.{h,cxx}
+  Logic/Preprocessing/GMM/GaussianMixtureModel.{h,cxx}
+  Logic/Preprocessing/GMM/EMGaussianMixtures.{h,cxx}
+  Logic/Preprocessing/GMM/KMeansPlusPlus.{h,cxx}
+  Logic/Preprocessing/GMM/Gaussian.{h,cxx}
+
+Image Classification:
+  Logic/Preprocessing/GMMClassifyImageFilter.{h,txx}
+
+Application Integration:
+  Logic/Framework/IRISApplication.{h,cxx}
+
+GUI/Model:
+  GUI/Model/SnakeWizardModel.{h,cxx}
+  GUI/Qt/Windows/SpeedImageDialog.{h,cxx}
+  GUI/Renderer/GMMRenderer.cxx
+  GUI/Qt/ModelView/GMMTableModel.{h,cxx}
+
