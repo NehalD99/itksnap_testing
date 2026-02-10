@@ -20,3 +20,9 @@ CTestConfig.cmake.user*
 Utilities/Translation/.ipynb_checkpoints
 
 build/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
