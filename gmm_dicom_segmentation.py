@@ -25,6 +25,8 @@ import sys
 from pathlib import Path
 from typing import List, Tuple, Optional
 import logging
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -417,6 +419,49 @@ class EMGaussianMixtures:
         return self.gmm
 
 
+def _process_batch_for_classification(batch_info: Tuple[np.ndarray, GaussianMixtureModel, 
+                                                        np.ndarray, np.ndarray, int]) -> np.ndarray:
+    """
+    Process a batch of voxels for classification (worker function for parallel processing).
+    
+    This function is designed to be called by multiprocessing workers.
+    
+    Args:
+        batch_info: Tuple containing (batch_data, gmm, log_weights, fg_factors, n_clusters)
+    
+    Returns:
+        Speed values for the batch
+    """
+    batch_data, gmm, log_weights, fg_factors, n_clusters = batch_info
+    batch_size = len(batch_data)
+    batch_results = np.zeros(batch_size)
+    
+    # Compute log PDFs for all components
+    log_pdfs = np.zeros((batch_size, n_clusters))
+    for k in range(n_clusters):
+        for i, x in enumerate(batch_data):
+            log_pdfs[i, k] = gmm.evaluate_log_pdf(k, x)
+    
+    # Compute posteriors and weighted probability difference
+    for i in range(batch_size):
+        pdiff = 0.0
+        for k in range(n_clusters):
+            # Compute posterior using log-space arithmetic
+            max_log = np.max(log_pdfs[i] + log_weights)
+            log_sum = max_log + np.log(
+                np.sum(gmm.weights * np.exp(log_pdfs[i] - max_log))
+            )
+            posterior = np.exp(log_weights[k] + log_pdfs[i, k] - log_sum)
+            
+            # Accumulate weighted by foreground/background
+            pdiff += posterior * fg_factors[k]
+        
+        # Scale to [-32767, 32767] as in ITK-SNAP
+        batch_results[i] = pdiff * 32767.0
+    
+    return batch_results
+
+
 class GMMDicomSegmentation:
     """
     Main class for GMM-based DICOM segmentation.
@@ -425,7 +470,8 @@ class GMMDicomSegmentation:
     """
     
     def __init__(self, n_clusters: int = 3, n_samples: int = 10000, 
-                 em_iterations: int = 10, random_seed: Optional[int] = None):
+                 em_iterations: int = 10, random_seed: Optional[int] = None,
+                 n_jobs: int = -1):
         """
         Initialize segmentation pipeline.
         
@@ -434,10 +480,13 @@ class GMMDicomSegmentation:
             n_samples: Number of voxels to sample for training
             em_iterations: Number of EM iterations
             random_seed: Random seed for reproducibility
+            n_jobs: Number of parallel jobs for classification. 
+                   -1 means use all CPUs, 1 means single-threaded
         """
         self.n_clusters = n_clusters
         self.n_samples = n_samples
         self.em_iterations = em_iterations
+        self.n_jobs = cpu_count() if n_jobs == -1 else max(1, n_jobs)
         
         if random_seed is not None:
             np.random.seed(random_seed)
@@ -568,6 +617,7 @@ class GMMDicomSegmentation:
         Classify all voxels in the image using the trained GMM.
         
         Equivalent to GMMClassifyImageFilter::DynamicThreadedGenerateData()
+        Uses parallel processing similar to ITK's multi-threading.
         
         Args:
             foreground_clusters: List of cluster indices to mark as foreground.
@@ -582,7 +632,7 @@ class GMMDicomSegmentation:
         if self.image_data is None:
             raise ValueError("No image data loaded.")
         
-        logger.info("Classifying full image")
+        logger.info(f"Classifying full image using {self.n_jobs} worker(s)")
         
         # Set foreground/background state
         if foreground_clusters is not None:
@@ -604,7 +654,6 @@ class GMMDicomSegmentation:
             output_shape = (z, y, x)
         
         total_voxels = z * y * x
-        speed_map = np.zeros(total_voxels)
         
         # Precompute log weights
         log_weights = np.log(self.gmm.weights + 1e-300)
@@ -617,37 +666,40 @@ class GMMDicomSegmentation:
         batch_size = 10000
         n_batches = (total_voxels + batch_size - 1) // batch_size
         
+        # Create batches
+        batches = []
         for batch_idx in range(n_batches):
             start_idx = batch_idx * batch_size
             end_idx = min(start_idx + batch_size, total_voxels)
             batch_data = flat_data[start_idx:end_idx]
-            
-            # Compute log PDFs for all components
-            log_pdfs = np.zeros((len(batch_data), self.n_clusters))
-            for k in range(self.n_clusters):
-                for i, x in enumerate(batch_data):
-                    log_pdfs[i, k] = self.gmm.evaluate_log_pdf(k, x)
-            
-            # Compute posteriors and weighted probability difference
-            for i in range(len(batch_data)):
-                pdiff = 0.0
-                for k in range(self.n_clusters):
-                    # Compute posterior using log-space arithmetic
-                    max_log = np.max(log_pdfs[i] + log_weights)
-                    log_sum = max_log + np.log(
-                        np.sum(self.gmm.weights * np.exp(log_pdfs[i] - max_log))
-                    )
-                    posterior = np.exp(log_weights[k] + log_pdfs[i, k] - log_sum)
-                    
-                    # Accumulate weighted by foreground/background
-                    pdiff += posterior * fg_factors[k]
+            batches.append((batch_data, self.gmm, log_weights, fg_factors, self.n_clusters))
+        
+        # Process batches in parallel or sequentially
+        if self.n_jobs == 1:
+            # Single-threaded processing (for debugging or small images)
+            results = []
+            for i, batch_info in enumerate(batches):
+                result = _process_batch_for_classification(batch_info)
+                results.append(result)
                 
-                # Scale to [-32767, 32767] as in ITK-SNAP
-                speed_map[start_idx + i] = pdiff * 32767.0
-            
-            if (batch_idx + 1) % 10 == 0 or batch_idx == n_batches - 1:
-                logger.info(f"  Processed {end_idx}/{total_voxels} voxels "
-                           f"({100*end_idx//total_voxels}%)")
+                if (i + 1) % 10 == 0 or i == n_batches - 1:
+                    processed = min((i + 1) * batch_size, total_voxels)
+                    logger.info(f"  Processed {processed}/{total_voxels} voxels "
+                               f"({100*processed//total_voxels}%)")
+        else:
+            # Multi-threaded processing using process pool
+            with Pool(processes=self.n_jobs) as pool:
+                results = []
+                for i, result in enumerate(pool.imap(_process_batch_for_classification, batches)):
+                    results.append(result)
+                    
+                    if (i + 1) % 10 == 0 or i == n_batches - 1:
+                        processed = min((i + 1) * batch_size, total_voxels)
+                        logger.info(f"  Processed {processed}/{total_voxels} voxels "
+                                   f"({100*processed//total_voxels}%)")
+        
+        # Concatenate all results
+        speed_map = np.concatenate(results)
         
         # Reshape to original spatial dimensions
         speed_map = speed_map.reshape(output_shape)
@@ -758,6 +810,8 @@ Examples:
     parser.add_argument('--foreground', type=int, nargs='+',
                        help='Cluster indices to mark as foreground (default: all)')
     parser.add_argument('--seed', type=int, help='Random seed for reproducibility')
+    parser.add_argument('--n-jobs', type=int, default=-1,
+                       help='Number of parallel jobs for classification. -1 uses all CPUs, 1 is single-threaded (default: -1)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
     
     args = parser.parse_args()
@@ -791,7 +845,8 @@ Examples:
             n_clusters=args.clusters,
             n_samples=args.samples,
             em_iterations=args.em_iterations,
-            random_seed=args.seed
+            random_seed=args.seed,
+            n_jobs=args.n_jobs
         )
         
         speed_map = segmenter.run(args.dicom_path, args.foreground)

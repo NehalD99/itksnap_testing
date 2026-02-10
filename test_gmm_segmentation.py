@@ -120,37 +120,102 @@ def test_full_pipeline():
     print(f"  Created synthetic image: shape={image.shape}")
     print(f"  Image range: [{image.min():.2f}, {image.max():.2f}]")
     
-    # Create segmenter
-    segmenter = GMMDicomSegmentation(n_clusters=3, n_samples=1000, 
-                                    em_iterations=5, random_seed=42)
-    
-    # Set image data directly
-    segmenter.image_data = image
-    
-    # Run pipeline steps
-    print("  Step 1: Sampling voxels...")
-    segmenter.sample_voxels()
-    print(f"    Sampled {len(segmenter.sampled_data)} voxels")
-    
-    print("  Step 2: Initializing clusters...")
-    segmenter.initialize_clusters()
-    
-    print("  Step 3: Refining with EM...")
-    segmenter.refine_clusters()
-    
-    print("  Step 4: Classifying image...")
-    speed_map = segmenter.classify_image()
-    
-    print(f"  Speed map shape: {speed_map.shape}")
-    print(f"  Speed map range: [{speed_map.min():.2f}, {speed_map.max():.2f}]")
-    
-    assert speed_map.shape == image.shape, "Speed map should have same shape as input"
-    assert np.all(np.isfinite(speed_map)), "Speed map should be finite"
+    # Test with both single-threaded and multi-threaded
+    for n_jobs in [1, -1]:
+        job_desc = "single-threaded" if n_jobs == 1 else "multi-threaded"
+        print(f"\n  Testing {job_desc} (n_jobs={n_jobs})...")
+        
+        # Create segmenter
+        segmenter = GMMDicomSegmentation(n_clusters=3, n_samples=1000, 
+                                        em_iterations=5, random_seed=42, n_jobs=n_jobs)
+        
+        # Set image data directly
+        segmenter.image_data = image
+        
+        # Run pipeline steps
+        print(f"    Step 1: Sampling voxels...")
+        segmenter.sample_voxels()
+        print(f"      Sampled {len(segmenter.sampled_data)} voxels")
+        
+        print(f"    Step 2: Initializing clusters...")
+        segmenter.initialize_clusters()
+        
+        print(f"    Step 3: Refining with EM...")
+        segmenter.refine_clusters()
+        
+        print(f"    Step 4: Classifying image...")
+        speed_map = segmenter.classify_image()
+        
+        print(f"    Speed map shape: {speed_map.shape}")
+        print(f"    Speed map range: [{speed_map.min():.2f}, {speed_map.max():.2f}]")
+        
+        assert speed_map.shape == image.shape, "Speed map should have same shape as input"
+        assert np.all(np.isfinite(speed_map)), "Speed map should be finite"
     
     # Print cluster info
     segmenter.print_cluster_info()
     
     print("  ✓ Full pipeline test passed\n")
+
+
+
+
+def test_multithreading():
+    """Test multithreading performance."""
+    print("Testing multithreading performance...")
+    
+    # Create a larger synthetic image
+    np.random.seed(789)
+    z, y, x = 30, 30, 30
+    image = np.random.randn(z, y, x) * 50 + 100
+    
+    print(f"  Created image: {z}x{y}x{x} = {z*y*x} voxels")
+    
+    import time
+    
+    # Test single-threaded
+    print("\n  Running single-threaded (n_jobs=1)...")
+    segmenter_st = GMMDicomSegmentation(
+        n_clusters=3, n_samples=1000, em_iterations=3, random_seed=789, n_jobs=1
+    )
+    segmenter_st.image_data = image
+    segmenter_st.sample_voxels()
+    segmenter_st.initialize_clusters()
+    segmenter_st.refine_clusters()
+    
+    start_st = time.time()
+    speed_map_st = segmenter_st.classify_image()
+    time_st = time.time() - start_st
+    print(f"    Time: {time_st:.3f} seconds")
+    
+    # Test multi-threaded
+    print("\n  Running multi-threaded (n_jobs=-1)...")
+    segmenter_mt = GMMDicomSegmentation(
+        n_clusters=3, n_samples=1000, em_iterations=3, random_seed=789, n_jobs=-1
+    )
+    segmenter_mt.image_data = image
+    segmenter_mt.sample_voxels()
+    segmenter_mt.initialize_clusters()
+    segmenter_mt.refine_clusters()
+    
+    start_mt = time.time()
+    speed_map_mt = segmenter_mt.classify_image()
+    time_mt = time.time() - start_mt
+    print(f"    Time: {time_mt:.3f} seconds")
+    
+    # Check results are identical (with same random seed)
+    print(f"\n  Verifying results match...")
+    assert np.allclose(speed_map_st, speed_map_mt, rtol=1e-10), "Results should be identical"
+    print(f"    ✓ Results are identical")
+    
+    # Report speedup
+    speedup = time_st / time_mt if time_mt > 0 else 1.0
+    print(f"\n  Performance:")
+    print(f"    Single-threaded: {time_st:.3f}s")
+    print(f"    Multi-threaded:  {time_mt:.3f}s")
+    print(f"    Speedup: {speedup:.2f}x")
+    
+    print("  ✓ Multithreading test passed\n")
 
 
 def test_with_simpleITK():
@@ -196,6 +261,7 @@ def main():
         test_kmeans_plusplus()
         test_em_algorithm()
         test_full_pipeline()
+        test_multithreading()
         test_with_simpleITK()
         
         print("="*60)
